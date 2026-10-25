@@ -98,6 +98,7 @@ export function ChildVaccinationTracker() {
     const todayDateInput = useMemo(() => getTodayDateInput(), []);
     const [tracker, setTracker] = useState<ChildTrackerState>(EMPTY_TRACKER_STATE);
     const [isOcrScanning, setIsOcrScanning] = useState(false);
+    const [scanProgress, setScanProgress] = useState(0);
     const [ocrError, setOcrError] = useState<string | null>(null);
     const [syncError, setSyncError] = useState<string | null>(null);
     const [syncRetryToken, setSyncRetryToken] = useState(0);
@@ -383,7 +384,7 @@ export function ChildVaccinationTracker() {
             );
             return;
         }
-
+        setScanProgress(0);
         setIsOcrScanning(true);
         let worker: Tesseract.Worker | null = null;
         try {
@@ -394,7 +395,18 @@ export function ChildVaccinationTracker() {
                 reader.onerror = () => reject(new Error("Failed to read file"));
                 reader.readAsDataURL(file);
             });
-            worker = await Tesseract.createWorker("eng");
+            worker = await Tesseract.createWorker("eng", 1, {
+                logger: (message) => {
+                    if (
+                        message.status === "recognizing text" &&
+                        typeof message.progress === "number"
+                    ) {
+                        setScanProgress(
+                            Math.max(0, Math.min(100, Math.round(message.progress * 100)))
+                        );
+                    }
+                },
+            });
             const { data } = await worker.recognize(dataUrl);
             const text = data.text;
 
@@ -443,6 +455,7 @@ export function ChildVaccinationTracker() {
                 }
             }
             setIsOcrScanning(false);
+            setScanProgress(0);
         }
     };
     const downloadCalendarReminders = () => {
@@ -504,6 +517,29 @@ export function ChildVaccinationTracker() {
                     <Download size={16} aria-hidden="true" />
                     {t("childReminderButton")}
                 </button>
+            </div>
+            <div className="mt-3 h-12" aria-live="polite" aria-atomic="true">
+                {isOcrScanning && (
+                    <div className="flex h-full items-center gap-3 rounded-lg border border-emerald-100 bg-emerald-50/70 px-3 dark:border-emerald-900/60 dark:bg-emerald-950/20">
+                        <span className="w-28 shrink-0 text-sm font-semibold text-emerald-800 dark:text-emerald-200">
+                            Scanning: {scanProgress}%
+                        </span>
+
+                        <div
+                            className="h-2 min-w-0 flex-1 overflow-hidden rounded-full bg-slate-100 dark:bg-slate-700"
+                            role="progressbar"
+                            aria-label="OCR scanning progress"
+                            aria-valuemin={0}
+                            aria-valuemax={100}
+                            aria-valuenow={scanProgress}
+                        >
+                            <div
+                                className="h-full rounded-full bg-emerald-600 transition-all duration-300 ease-out"
+                                style={{ width: `${scanProgress}%` }}
+                            />
+                        </div>
+                    </div>
+                )}
             </div>
 
             <div className="mt-5 grid grid-cols-1 gap-4 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
