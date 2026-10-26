@@ -14,11 +14,12 @@ import {
     CheckCircle2,
     WifiOff,
 } from "lucide-react";
-import { fuzzyMatchBrand } from "@/lib/api";
+import { fuzzyMatchBrand, getTrackedMedicines } from "@/lib/api";
 import { checkInteractions, type InteractionResult } from "@/lib/api/interactions";
 import { VoiceInputButton } from "@/components/ui/VoiceInputButton";
 import { PageHeader } from "../components/PageHeader";
 import { MAX_INTERACTION_MEDICINES } from "@sahidawa/shared";
+import { useSession } from "@/src/components/AuthProvider";
 
 const STORAGE_KEY = "sahidawa-my-medicines";
 
@@ -91,7 +92,8 @@ export default function InteractionCheckerPage() {
     const [hasChecked, setHasChecked] = useState(false);
     const [isOfflineResult, setIsOfflineResult] = useState(false);
     const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(-1);
-
+    const [isImportingCabinet, setIsImportingCabinet] = useState(false);
+    const { token } = useSession();
     const inputRef = useRef<HTMLInputElement>(null);
     const dropdownRef = useRef<HTMLDivElement>(null);
 
@@ -231,7 +233,59 @@ export default function InteractionCheckerPage() {
     const handleClearAll = () => {
         saveMedicinesList([]);
     };
+    const handleImportFromCabinet = async () => {
+        if (!token || isImportingCabinet) return;
 
+        setIsImportingCabinet(true);
+        setError(null);
+
+        try {
+            const trackedMedicines = await getTrackedMedicines(token);
+
+            const existingNames = new Set(
+                selectedMedicines.map((name) => name.trim().toLowerCase())
+            );
+            const medicinesToAdd: string[] = [];
+
+            for (const medicine of trackedMedicines) {
+                const name = (medicine.medicine_name ?? "")
+                    .trim()
+                    .replace(/[\x00-\x1F\x7F-\x9F<>]/g, "");
+
+                if (!name || name.length > 100) continue;
+
+                const normalizedName = name.toLowerCase();
+
+                if (existingNames.has(normalizedName)) continue;
+
+                if (selectedMedicines.length + medicinesToAdd.length >= MAX_INTERACTION_MEDICINES) {
+                    break;
+                }
+
+                existingNames.add(normalizedName);
+                medicinesToAdd.push(name);
+            }
+
+            if (medicinesToAdd.length === 0) {
+                if (trackedMedicines.length === 0) {
+                    setError("No medicines found in your Cabinet.");
+                } else if (selectedMedicines.length >= MAX_INTERACTION_MEDICINES) {
+                    setError(`Maximum of ${MAX_INTERACTION_MEDICINES} medicines can be selected.`);
+                } else {
+                    setError("All your Cabinet medicines are already selected.");
+                }
+                return;
+            }
+
+            saveMedicinesList([...selectedMedicines, ...medicinesToAdd]);
+        } catch (err) {
+            setError(
+                err instanceof Error ? err.message : "Failed to import medicines from your Cabinet."
+            );
+        } finally {
+            setIsImportingCabinet(false);
+        }
+    };
     const handleCheckInteractions = async () => {
         if (selectedMedicines.length < 2) {
             setError(t("minMedicinesError"));
@@ -322,6 +376,22 @@ export default function InteractionCheckerPage() {
 
                 {/* Search Card */}
                 <div className="mb-6 rounded-3xl border border-(--color-border-muted) bg-(--color-surface-page) p-6 shadow-sm">
+                    {token && (
+                        <div className="mb-4 flex justify-end">
+                            <button
+                                type="button"
+                                onClick={handleImportFromCabinet}
+                                disabled={
+                                    isImportingCabinet ||
+                                    selectedMedicines.length >= MAX_INTERACTION_MEDICINES
+                                }
+                                aria-busy={isImportingCabinet}
+                                className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-sm font-bold text-emerald-700 transition hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-emerald-900/40 dark:bg-emerald-950/20 dark:text-emerald-400"
+                            >
+                                {isImportingCabinet ? "Importing..." : "Import from Cabinet"}
+                            </button>
+                        </div>
+                    )}
                     <div className="relative" ref={dropdownRef}>
                         <label className="mb-2 block text-sm font-bold text-(--color-text-primary)">
                             {t("searchLabel")}
@@ -337,11 +407,18 @@ export default function InteractionCheckerPage() {
                                 aria-expanded={suggestions.length > 0}
                                 aria-autocomplete="list"
                                 aria-controls="interaction-search-suggestions"
-                                aria-activedescendant={activeSuggestionIndex >= 0 ? `suggestion-${activeSuggestionIndex}` : undefined}
+                                aria-activedescendant={
+                                    activeSuggestionIndex >= 0
+                                        ? `suggestion-${activeSuggestionIndex}`
+                                        : undefined
+                                }
                                 className="w-full rounded-xl border border-(--color-border-muted) bg-(--color-surface-muted) px-4 py-3 font-semibold text-(--color-text-primary) placeholder-(--color-text-muted) shadow-inner focus:ring-2 focus:ring-emerald-500 focus:outline-none"
                                 onKeyDown={(e) => {
                                     if (e.key === "Enter") {
-                                        if (activeSuggestionIndex >= 0 && activeSuggestionIndex < suggestions.length) {
+                                        if (
+                                            activeSuggestionIndex >= 0 &&
+                                            activeSuggestionIndex < suggestions.length
+                                        ) {
                                             handleAddMedicine(suggestions[activeSuggestionIndex]);
                                         } else if (searchQuery.trim()) {
                                             handleAddMedicine(searchQuery);

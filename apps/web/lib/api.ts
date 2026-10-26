@@ -573,3 +573,39 @@ export async function compareMedicineSimilarity(
         signal,
     });
 }
+
+export interface TrackedMedicine {
+    id: string;
+    medicine_name: string;
+    batch_number?: string | null;
+    expiry_date?: string | null;
+    is_verified?: boolean;
+}
+
+export async function getTrackedMedicines(token?: string | null): Promise<TrackedMedicine[]> {
+    const response = await fetchWithRetry(`${API_BASE}/api/v1/medicines/tracked`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+        credentials: "include",
+        timeout: 10000,
+    });
+
+    const payload = await response.json().catch(() => null);
+
+    if (!response.ok) {
+        throw new Error(
+            typeof payload?.error === "string"
+                ? payload.error
+                : "Failed to load medicines from your Cabinet."
+        );
+    }
+
+    if (Array.isArray(payload)) {
+        return payload as TrackedMedicine[];
+    }
+
+    if (Array.isArray(payload?.medicines)) {
+        return payload.medicines as TrackedMedicine[];
+    }
+
+    return [];
+}
