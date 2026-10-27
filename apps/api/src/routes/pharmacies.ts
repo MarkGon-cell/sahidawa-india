@@ -5,7 +5,7 @@ import { uuidSchema } from "../utils/validation";
 
 import logger from "../utils/logger";
 import { limiter } from "../middleware/rateLimit";
-import { requireAuth, AuthenticatedRequest } from "../middleware/auth";
+import { requireAuth, requireRole, AuthenticatedRequest } from "../middleware/auth";
 import { redisCache } from "../middleware/redisCache";
 import { cacheMiddleware } from "../middleware/cache";
 import multer from "multer";
@@ -148,6 +148,18 @@ const adminOnlyPharmacyFieldsSchema = z
     })
     .strict();
 
+const pharmacyClaimSchema = z.object({
+    pharmacy_id: uuidSchema,
+    drug_license_number: z
+        .string()
+        .trim()
+        .regex(/^\d{20}$/, "Drug License Number must contain exactly 20 digits"),
+    owner_name: z.string().trim().min(2, "Owner name is required").max(150),
+    phone_number: z
+        .string()
+        .trim()
+        .regex(/^\+?[\d\s\-()]{7,15}$/, "Invalid phone number"),
+});
 // Zod schema for validating each individual item inside an uploaded row
 const inventoryRowSchema = z.object({
     medicine_name: z.string().min(1, "Medicine name is required"),
@@ -192,7 +204,7 @@ async function parseCsvIncremental(
                 let rowsToInsert: any[] = [];
                 let nonEmptyDataRows = 0;
                 let successfulInserts = 0;
-                
+
                 // If there was a fatal parsing error that halted the parse early
                 const parseErrors = results.errors;
                 if (parseErrors && parseErrors.length > 0 && parseErrors[0].type === "Delimiter") {
@@ -200,7 +212,7 @@ async function parseCsvIncremental(
                         successfulInserts,
                         failedRows,
                         totalRows: nonEmptyDataRows,
-                        error: parseErrors.map(e => e.message).join(", ")
+                        error: parseErrors.map((e) => e.message).join(", "),
                     });
                 }
 
@@ -208,7 +220,9 @@ async function parseCsvIncremental(
                     const rowData = results.data[i];
                     const logicalRow = i + 2; // +1 for 0-index, +1 for header
 
-                    const allEmpty = Object.values(rowData).every((v) => v === "" || v === undefined);
+                    const allEmpty = Object.values(rowData).every(
+                        (v) => v === "" || v === undefined
+                    );
                     if (allEmpty) continue;
 
                     nonEmptyDataRows++;
@@ -223,9 +237,12 @@ async function parseCsvIncremental(
                     }
 
                     // Log parsing errors for this specific row (if any)
-                    const rowErrors = parseErrors.filter(e => e.row === i);
+                    const rowErrors = parseErrors.filter((e) => e.row === i);
                     if (rowErrors.length > 0) {
-                        failedRows.push({ row: logicalRow, reason: rowErrors.map((e) => e.message).join(", ") });
+                        failedRows.push({
+                            row: logicalRow,
+                            reason: rowErrors.map((e) => e.message).join(", "),
+                        });
                         continue;
                     }
 
@@ -237,7 +254,9 @@ async function parseCsvIncremental(
 
                     const validationResult = inventoryRowSchema.safeParse(normalised);
                     if (!validationResult.success) {
-                        const reason = validationResult.error.issues.map((issue) => issue.message).join(", ");
+                        const reason = validationResult.error.issues
+                            .map((issue) => issue.message)
+                            .join(", ");
                         failedRows.push({ row: logicalRow, reason });
                         continue;
                     }
@@ -255,9 +274,13 @@ async function parseCsvIncremental(
                     if (rowsToInsert.length >= BATCH_SIZE || i === results.data.length - 1) {
                         if (rowsToInsert.length > 0) {
                             try {
-                                const { error } = await client.from("pharmacy_inventory").insert(rowsToInsert);
+                                const { error } = await client
+                                    .from("pharmacy_inventory")
+                                    .insert(rowsToInsert);
                                 if (error) {
-                                    logger.error(`Database bulk insertion failed: ${error.message}`);
+                                    logger.error(
+                                        `Database bulk insertion failed: ${error.message}`
+                                    );
                                     return resolve({
                                         successfulInserts,
                                         failedRows,
@@ -265,7 +288,7 @@ async function parseCsvIncremental(
                                         error: "Database operation failed during insertion.",
                                     });
                                 }
-                                
+
                                 successfulInserts += rowsToInsert.length;
                                 if (onProgress) {
                                     onProgress({
@@ -276,7 +299,9 @@ async function parseCsvIncremental(
                                 }
                                 rowsToInsert = [];
                             } catch (err: any) {
-                                logger.error(`Database bulk insertion error: ${err instanceof Error ? err.message : String(err)}`);
+                                logger.error(
+                                    `Database bulk insertion error: ${err instanceof Error ? err.message : String(err)}`
+                                );
                                 return resolve({
                                     successfulInserts,
                                     failedRows,
@@ -344,7 +369,366 @@ router.post(
         }
     }
 );
+router.post(
+    "/claim",
+    requireAuth,
+    limiter,
+    async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+        try {
+            if (!req.user) {
+                res.status(401).json({ error: "Unauthorized access" });
+                return;
+            }
 
+            const parsed = pharmacyClaimSchema.safeParse(req.body);
+
+            if (!parsed.success) {
+                res.status(400).json({
+                    error: "Invalid pharmacy claim payload",
+                    issues: parsed.error.issues,
+                });
+                return;
+            }
+
+            const { data: existingClaim, error: existingClaimError } = await supabase
+                .from("pharmacy_claims")
+                .select("id, status")
+                .eq("pharmacy_id", parsed.data.pharmacy_id)
+                .eq("user_id", req.user.id)
+                .maybeSingle();
+
+            if (existingClaimError) {
+                throw existingClaimError;
+            }
+
+            if (existingClaim) {
+                res.status(409).json({
+                    error: "You have already submitted a claim for this pharmacy",
+                    status: existingClaim.status,
+                });
+                return;
+            }
+
+            const { data: pharmacy, error: pharmacyError } = await supabase
+                .from("pharmacies")
+                .select("id")
+                .eq("id", parsed.data.pharmacy_id)
+                .maybeSingle();
+
+            if (pharmacyError) {
+                throw pharmacyError;
+            }
+
+            if (!pharmacy) {
+                res.status(404).json({
+                    error: "Pharmacy not found",
+                });
+                return;
+            }
+
+            const { data: claim, error: claimError } = await supabase
+                .from("pharmacy_claims")
+                .insert({
+                    pharmacy_id: parsed.data.pharmacy_id,
+                    user_id: req.user.id,
+                    drug_license_number: parsed.data.drug_license_number,
+                    owner_name: parsed.data.owner_name,
+                    phone_number: parsed.data.phone_number,
+                    status: "pending",
+                })
+                .select()
+                .single();
+
+            if (claimError) {
+                throw claimError;
+            }
+
+            res.status(201).json({
+                message: "Pharmacy claim submitted successfully",
+                claim,
+            });
+        } catch (err) {
+            next(err);
+        }
+    }
+);
+/**
+ * GET /api/pharmacies/my-claims
+ * Return pharmacy claims submitted by the authenticated pharmacist.
+ */
+router.get(
+    "/my-claims",
+    requireAuth,
+    limiter,
+    async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+        try {
+            if (!req.user) {
+                res.status(401).json({
+                    error: "Unauthorized access",
+                });
+                return;
+            }
+
+            const { data: claims, error } = await supabase
+                .from("pharmacy_claims")
+                .select(
+                    `
+                    id,
+                    pharmacy_id,
+                    user_id,
+                    drug_license_number,
+                    owner_name,
+                    phone_number,
+                    status,
+                    created_at,
+                    updated_at,
+                    pharmacies (
+                        id,
+                        name,
+                        address,
+                        district,
+                        state,
+                        phone_number,
+                        is_verified,
+                        is_active
+                    )
+                `
+                )
+                .eq("user_id", req.user.id)
+                .order("created_at", { ascending: false });
+
+            if (error) {
+                throw error;
+            }
+
+            res.json({
+                claims: claims ?? [],
+            });
+        } catch (err) {
+            next(err);
+        }
+    }
+);
+// ── Pharmacy claim administration ─────────────────────────────────────────────
+
+const pharmacyClaimReviewSchema = z.object({
+    rejection_reason: z.string().trim().max(500, "Rejection reason is too long").optional(),
+});
+
+/**
+ * GET /api/pharmacies/admin/claims
+ *
+ * Returns pharmacy claims for admin/moderator review.
+ */
+router.get(
+    "/admin/claims",
+    requireAuth,
+    requireRole("admin", "moderator"),
+    limiter,
+    async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+        try {
+            const status = typeof req.query.status === "string" ? req.query.status : "pending";
+
+            if (!["pending", "approved", "rejected"].includes(status)) {
+                res.status(400).json({
+                    error: "Invalid claim status",
+                });
+                return;
+            }
+
+            const { data: claims, error } = await supabase
+                .from("pharmacy_claims")
+                .select(
+                    `
+                    id,
+                    pharmacy_id,
+                    user_id,
+                    drug_license_number,
+                    owner_name,
+                    phone_number,
+                    status,
+                    created_at,
+                    updated_at,
+                    pharmacies (
+                        id,
+                        name,
+                        address,
+                        district,
+                        state,
+                        phone_number,
+                        is_verified,
+                        is_active
+                    )
+                `
+                )
+                .eq("status", status)
+                .order("created_at", { ascending: false });
+
+            if (error) throw error;
+
+            res.json({
+                claims: claims ?? [],
+                total: claims?.length ?? 0,
+            });
+        } catch (err) {
+            next(err);
+        }
+    }
+);
+/**
+ * POST /api/pharmacies/admin/claims/:id/approve
+ *
+ * Approves a pending pharmacy claim and verifies the pharmacy.
+ */
+router.post(
+    "/admin/claims/:id/approve",
+    requireAuth,
+    requireRole("admin", "moderator"),
+    limiter,
+    async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+        try {
+            const claimId = uuidSchema.safeParse(req.params.id);
+
+            if (!claimId.success) {
+                res.status(400).json({
+                    error: "Invalid claim ID",
+                });
+                return;
+            }
+
+            const { data: claim, error: claimFetchError } = await supabase
+                .from("pharmacy_claims")
+                .select("id, pharmacy_id, status")
+                .eq("id", claimId.data)
+                .maybeSingle();
+
+            if (claimFetchError) throw claimFetchError;
+
+            if (!claim) {
+                res.status(404).json({
+                    error: "Pharmacy claim not found",
+                });
+                return;
+            }
+
+            if (claim.status !== "pending") {
+                res.status(409).json({
+                    error: `Claim has already been ${claim.status}`,
+                });
+                return;
+            }
+
+            const { error: claimUpdateError } = await supabase
+                .from("pharmacy_claims")
+                .update({
+                    status: "approved",
+                    updated_at: new Date().toISOString(),
+                })
+                .eq("id", claim.id)
+                .eq("status", "pending");
+
+            if (claimUpdateError) throw claimUpdateError;
+
+            const { data: pharmacy, error: pharmacyUpdateError } = await supabase
+                .from("pharmacies")
+                .update({
+                    is_verified: true,
+                })
+                .eq("id", claim.pharmacy_id)
+                .select("id, name, is_verified")
+                .single();
+
+            if (pharmacyUpdateError) throw pharmacyUpdateError;
+
+            res.json({
+                message: "Pharmacy claim approved successfully",
+                claim: {
+                    id: claim.id,
+                    status: "approved",
+                },
+                pharmacy,
+            });
+        } catch (err) {
+            next(err);
+        }
+    }
+);
+/**
+ * POST /api/pharmacies/admin/claims/:id/reject
+ *
+ * Rejects a pending pharmacy claim.
+ */
+router.post(
+    "/admin/claims/:id/reject",
+    requireAuth,
+    requireRole("admin", "moderator"),
+    limiter,
+    async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+        try {
+            const claimId = uuidSchema.safeParse(req.params.id);
+
+            if (!claimId.success) {
+                res.status(400).json({
+                    error: "Invalid claim ID",
+                });
+                return;
+            }
+
+            const parsed = pharmacyClaimReviewSchema.safeParse(req.body);
+
+            if (!parsed.success) {
+                res.status(400).json({
+                    error: "Invalid rejection payload",
+                    issues: parsed.error.issues,
+                });
+                return;
+            }
+
+            const { data: claim, error: fetchError } = await supabase
+                .from("pharmacy_claims")
+                .select("id, pharmacy_id, status")
+                .eq("id", claimId.data)
+                .maybeSingle();
+
+            if (fetchError) throw fetchError;
+
+            if (!claim) {
+                res.status(404).json({
+                    error: "Pharmacy claim not found",
+                });
+                return;
+            }
+
+            if (claim.status !== "pending") {
+                res.status(409).json({
+                    error: `Claim has already been ${claim.status}`,
+                });
+                return;
+            }
+
+            const { data: updatedClaim, error: updateError } = await supabase
+                .from("pharmacy_claims")
+                .update({
+                    status: "rejected",
+                    updated_at: new Date().toISOString(),
+                })
+                .eq("id", claim.id)
+                .eq("status", "pending")
+                .select()
+                .single();
+
+            if (updateError) throw updateError;
+
+            res.json({
+                message: "Pharmacy claim rejected",
+                claim: updatedClaim,
+                rejection_reason: parsed.data.rejection_reason ?? null,
+            });
+        } catch (err) {
+            next(err);
+        }
+    }
+);
 const nearestQuerySchema = z.object({
     lat: z.coerce.number().min(-90).max(90),
     lng: z.coerce.number().min(-180).max(180),
@@ -552,6 +936,44 @@ function handleFetchError(
  *       500:
  *         description: Database error
  */
+/**
+ * Search pharmacies for partner registration.
+ *
+ * GET /api/pharmacies/search?q=<pharmacy name>
+ *
+ * Used by the Partner Portal to allow pharmacists to
+ * select an existing pharmacy before submitting a claim.
+ */
+router.get("/search", limiter, async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const query = String(req.query.q ?? "").trim();
+
+        if (query.length < 2) {
+            res.status(400).json({
+                error: "Search query must contain at least 2 characters.",
+            });
+            return;
+        }
+
+        const { data: pharmacies, error } = await supabase
+            .from("pharmacies")
+            .select("id, name, address, district, state, phone_number, is_verified")
+            .ilike("name", `%${query}%`)
+            .eq("is_active", true)
+            .order("name", { ascending: true })
+            .limit(20);
+
+        if (error) {
+            throw error;
+        }
+
+        res.json({
+            pharmacies: pharmacies ?? [],
+        });
+    } catch (err) {
+        next(err);
+    }
+});
 router.get(
     "/search-by-medicine",
     limiter,

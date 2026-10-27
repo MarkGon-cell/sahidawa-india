@@ -1,376 +1,538 @@
 "use client";
 
-import React from "react";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Link } from "@/i18n/routing";
-import { ADMIN_API_BASE } from "@/lib/adminApi";
-import { getSessionAccessToken } from "@/lib/accessToken";
+import { useCallback, useEffect, useState } from "react";
 import {
     CheckCircle,
-    Clock,
-    Loader2,
-    MapPin,
-    RefreshCw,
-    ShieldAlert,
-    Store,
     XCircle,
+    Clock,
+    Store,
+    Phone,
+    FileText,
+    User,
+    MapPin,
+    Loader2,
+    RefreshCw,
+    ShieldCheck,
+    ShieldAlert,
 } from "lucide-react";
+const API_ORIGIN = (process.env.NEXT_PUBLIC_API_URL?.trim() || "http://localhost:4000").replace(
+    /\/+$/,
+    ""
+);
+import { useSession } from "@/src/components/AuthProvider";
+import {
+    getCsrfToken,
+    refreshCsrfToken,
+    invalidateCsrfToken,
+    isCsrfError,
+    CSRF_HEADER_NAME,
+} from "@/lib/csrf";
+import { parseApiErrorString } from "@/lib/apiErrorHandler";
 
-type PharmacyStatus = "pending" | "approved" | "rejected";
+type ClaimStatus = "pending" | "approved" | "rejected";
 
-type PendingPharmacy = {
+interface Pharmacy {
     id: string;
     name: string;
-    license_id: string | null;
-    address: string;
+    address: string | null;
     district: string | null;
     state: string | null;
     phone_number: string | null;
-    status: PharmacyStatus;
+    is_verified: boolean;
+    is_active: boolean;
+}
+
+interface PharmacyClaim {
+    id: string;
+    pharmacy_id: string;
+    user_id: string;
+    drug_license_number: string;
+    owner_name: string;
+    phone_number: string;
+    status: ClaimStatus;
     created_at: string;
-};
-
-function getToken(): string {
-    return getSessionAccessToken();
+    updated_at: string;
+    pharmacies: Pharmacy | null;
 }
+function getApiErrorMessage(data: unknown, fallback: string): string {
+    if (data && typeof data === "object" && "error" in data) {
+        const error = (data as { error?: unknown }).error;
 
-function timeAgo(dateStr: string): string {
-    const diff = Date.now() - new Date(dateStr).getTime();
-    const h = Math.floor(diff / 3_600_000);
-    const d = Math.floor(diff / 86_400_000);
-    if (h < 1) return "Just now";
-    if (h < 24) return `${h}h ago`;
-    return `${d}d ago`;
+        if (typeof error === "string") {
+            return error;
+        }
+
+        if (
+            error &&
+            typeof error === "object" &&
+            "message" in error &&
+            typeof (error as { message?: unknown }).message === "string"
+        ) {
+            return (error as { message: string }).message;
+        }
+    }
+
+    return fallback;
 }
+export default function PendingPharmacyClaimsPage() {
+    const { token, isLoading: authLoading } = useSession();
 
-export default function PendingPharmaciesPage() {
-    const queryClient = useQueryClient();
+    const [claims, setClaims] = useState<PharmacyClaim[]>([]);
+    const [loading, setLoading] = useState(true);
+    const [acting, setActing] = useState<string | null>(null);
+    const [error, setError] = useState<string | null>(null);
+    const [selectedClaim, setSelectedClaim] = useState<PharmacyClaim | null>(null);
 
-    const authHeaders = () => ({
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${getToken()}`,
-    });
+    const authHeaders = useCallback(
+        () => ({
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token ?? ""}`,
+        }),
+        [token]
+    );
 
-    // React Query Fetch
-    const {
-        data: pharmacies = [],
-        isLoading: loading,
-        error: fetchError,
-        refetch,
-    } = useQuery<PendingPharmacy[], Error>({
-        queryKey: ["pharmacies", "pending"],
-        queryFn: async () => {
-            const res = await fetch(`${ADMIN_API_BASE}/pharmacies/pending`, {
-                cache: "no-store",
+    const fetchClaims = useCallback(async () => {
+        if (!token) return;
+
+        setLoading(true);
+        setError(null);
+
+        try {
+            const res = await fetch(`${API_ORIGIN}/api/pharmacies/admin/claims?status=pending`, {
                 headers: authHeaders(),
             });
 
             if (res.status === 401) {
-                throw new Error("Sign in with an admin or moderator account to review pharmacies.");
+                throw new Error("You must be logged in to access this page.");
             }
+
             if (res.status === 403) {
-                throw new Error("Your account does not have access to pharmacy moderation.");
-            }
-            if (!res.ok) {
-                throw new Error("Pending pharmacies are unavailable. Please try again.");
+                throw new Error("You do not have permission to review pharmacy claims.");
             }
 
             const data = await res.json();
-            return data.pharmacies ?? [];
-        },
-    });
-
-    // React Query Mutation
-    const updateStatusMutation = useMutation({
-        mutationFn: async ({
-            pharmacyId,
-            status,
-        }: {
-            pharmacyId: string;
-            status: Exclude<PharmacyStatus, "pending">;
-        }) => {
-            const res = await fetch(`${ADMIN_API_BASE}/pharmacies/${pharmacyId}/status`, {
-                method: "PATCH",
-                headers: authHeaders(),
-                body: JSON.stringify({ status }),
-            });
 
             if (!res.ok) {
-                throw new Error("Could not update this pharmacy. Please try again.");
+                throw new Error(getApiErrorMessage(data, "Failed to load pharmacy claims."));
             }
-        },
-        onSuccess: () => {
-            queryClient.invalidateQueries({ queryKey: ["pharmacies", "pending"] });
-        },
-    });
 
-    const error = fetchError?.message || updateStatusMutation.error?.message || null;
+            setClaims(data.claims ?? []);
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Failed to load pharmacy claims.");
+        } finally {
+            setLoading(false);
+        }
+    }, [token, authHeaders]);
+
+    useEffect(() => {
+        if (!authLoading && token) {
+            fetchClaims();
+        }
+    }, [authLoading, token, fetchClaims]);
+
+    const handleApprove = async (claimId: string) => {
+        if (!token) return;
+
+        setActing(claimId);
+        setError(null);
+
+        try {
+            let csrfToken = await getCsrfToken();
+
+            const doRequest = (csrf: string) =>
+                fetch(`${API_ORIGIN}/api/pharmacies/admin/claims/${claimId}/approve`, {
+                    method: "POST",
+                    credentials: "include",
+                    headers: {
+                        ...authHeaders(),
+                        [CSRF_HEADER_NAME]: csrf,
+                    },
+                });
+
+            let res = await doRequest(csrfToken);
+
+            // Refresh CSRF token once if it has expired.
+            if (res.status === 403) {
+                const body = await res.json().catch(() => ({}));
+
+                if (isCsrfError(res.status, body)) {
+                    invalidateCsrfToken();
+                    csrfToken = await refreshCsrfToken();
+                    res = await doRequest(csrfToken);
+                } else {
+                    throw new Error(parseApiErrorString(body, "Failed to approve pharmacy claim."));
+                }
+            }
+
+            const data = await res.json().catch(() => ({}));
+
+            if (!res.ok) {
+                throw new Error(parseApiErrorString(data, "Failed to approve pharmacy claim."));
+            }
+
+            setClaims((prev) => prev.filter((claim) => claim.id !== claimId));
+            setSelectedClaim(null);
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Failed to approve pharmacy claim.");
+        } finally {
+            setActing(null);
+        }
+    };
+
+    const handleReject = async (claimId: string) => {
+        if (!token) return;
+
+        const confirmed = window.confirm("Are you sure you want to reject this pharmacy claim?");
+
+        if (!confirmed) return;
+
+        setActing(claimId);
+        setError(null);
+
+        try {
+            let csrfToken = await getCsrfToken();
+
+            const doRequest = (csrf: string) =>
+                fetch(`${API_ORIGIN}/api/pharmacies/admin/claims/${claimId}/reject`, {
+                    method: "POST",
+                    credentials: "include",
+                    headers: {
+                        ...authHeaders(),
+                        [CSRF_HEADER_NAME]: csrf,
+                    },
+                    body: JSON.stringify({}),
+                });
+
+            let res = await doRequest(csrfToken);
+
+            // Refresh CSRF token once if it has expired.
+            if (res.status === 403) {
+                const body = await res.json().catch(() => ({}));
+
+                if (isCsrfError(res.status, body)) {
+                    invalidateCsrfToken();
+                    csrfToken = await refreshCsrfToken();
+                    res = await doRequest(csrfToken);
+                } else {
+                    throw new Error(parseApiErrorString(body, "Failed to reject pharmacy claim."));
+                }
+            }
+
+            const data = await res.json().catch(() => ({}));
+
+            if (!res.ok) {
+                throw new Error(parseApiErrorString(data, "Failed to reject pharmacy claim."));
+            }
+
+            setClaims((prev) => prev.filter((claim) => claim.id !== claimId));
+            setSelectedClaim(null);
+        } catch (err) {
+            setError(err instanceof Error ? err.message : "Failed to reject pharmacy claim.");
+        } finally {
+            setActing(null);
+        }
+    };
+
+    if (authLoading) {
+        return (
+            <div className="flex min-h-screen items-center justify-center bg-slate-50">
+                <Loader2 className="h-6 w-6 animate-spin text-blue-600" />
+            </div>
+        );
+    }
+
     return (
-        <div className="flex min-h-screen bg-slate-50 font-sans">
-            <aside className="flex w-60 shrink-0 flex-col gap-6 border-r border-slate-200 bg-white p-5">
-                <div className="flex items-center gap-2 px-1">
-                    <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-emerald-600 text-xs font-bold text-white">
-                        S
-                    </div>
-                    <span className="font-bold text-slate-800">
-                        SahiDawa <span className="text-emerald-600">Admin</span>
-                    </span>
-                </div>
-                <nav className="flex flex-1 flex-col gap-0.5">
-                    <Link
-                        href="/admin/dashboard"
-                        className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm font-medium text-slate-500 transition-all hover:bg-slate-50 hover:text-slate-800"
-                    >
-                        <ShieldAlert className="h-4 w-4 text-slate-400" />
-                        Reports
-                    </Link>
-                    <Link
-                        href="/admin/pharmacies"
-                        className="flex w-full items-center gap-3 rounded-xl bg-emerald-50 px-3 py-2.5 text-sm font-medium text-emerald-600"
-                    >
-                        <Store className="h-4 w-4" />
-                        Pharmacies
-                    </Link>
-                </nav>
-                <p className="px-1 text-xs text-slate-400">SahiDawa Admin v1.0</p>
-            </aside>
-
-            <main className="flex min-h-0 flex-1 flex-col">
-                <header className="flex shrink-0 items-center justify-between border-b border-slate-200 bg-white px-8 py-4">
+        <div className="min-h-screen bg-slate-50">
+            {/* Header */}
+            <header className="border-b border-slate-200 bg-white">
+                <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-5">
                     <div>
-                        <h1 className="text-lg font-bold text-slate-900">Pending Pharmacies</h1>
-                        <p className="text-xs text-slate-400">
-                            Review new Jan Aushadhi Kendra registrations before they appear on the
-                            map
+                        <div className="flex items-center gap-3">
+                            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-blue-600 text-white">
+                                <Store className="h-5 w-5" />
+                            </div>
+
+                            <div>
+                                <h1 className="text-xl font-bold text-slate-900">
+                                    Pharmacy Verification
+                                </h1>
+
+                                <p className="text-sm text-slate-500">
+                                    Review and verify pharmacy partner claims
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <button
+                        onClick={fetchClaims}
+                        disabled={loading}
+                        className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-600 shadow-sm transition hover:bg-slate-50 disabled:opacity-50"
+                    >
+                        <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
+                        Refresh
+                    </button>
+                </div>
+            </header>
+
+            <main className="mx-auto max-w-7xl px-6 py-8">
+                {/* Stats */}
+                <div className="mb-6 grid gap-4 sm:grid-cols-3">
+                    <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                        <div className="mb-3 flex h-10 w-10 items-center justify-center rounded-xl bg-amber-50 text-amber-600">
+                            <Clock className="h-5 w-5" />
+                        </div>
+
+                        <p className="text-sm text-slate-500">Pending Verification</p>
+
+                        <p className="mt-1 text-3xl font-bold text-slate-900">{claims.length}</p>
+                    </div>
+
+                    <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                        <div className="mb-3 flex h-10 w-10 items-center justify-center rounded-xl bg-green-50 text-green-600">
+                            <ShieldCheck className="h-5 w-5" />
+                        </div>
+
+                        <p className="text-sm text-slate-500">Verification Status</p>
+
+                        <p className="mt-1 text-lg font-semibold text-green-600">Admin Review</p>
+                    </div>
+
+                    <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                        <div className="mb-3 flex h-10 w-10 items-center justify-center rounded-xl bg-blue-50 text-blue-600">
+                            <Store className="h-5 w-5" />
+                        </div>
+
+                        <p className="text-sm text-slate-500">Pharmacy Claims</p>
+
+                        <p className="mt-1 text-lg font-semibold text-slate-900">Partner Portal</p>
+                    </div>
+                </div>
+
+                {/* Error */}
+                {error && (
+                    <div className="mb-6 flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700">
+                        <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0" />
+                        <span>{error}</span>
+                    </div>
+                )}
+
+                {/* Claims */}
+                <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+                    <div className="border-b border-slate-100 px-6 py-5">
+                        <h2 className="font-semibold text-slate-900">Pending Pharmacy Claims</h2>
+
+                        <p className="mt-1 text-sm text-slate-500">
+                            Review the submitted pharmacy information before granting the verified
+                            badge.
                         </p>
                     </div>
-                    <button
-                        onClick={() => refetch()}
-                        className="rounded-full bg-slate-100 p-2 text-slate-500 transition hover:bg-slate-200"
-                        title="Refresh"
-                    >
-                        <RefreshCw className="h-4 w-4" />
-                    </button>
-                </header>
 
-                <div className="flex flex-1 flex-col gap-6 overflow-y-auto p-8">
-                    {/* Sub-nav tabs */}
-                    <div className="border-b border-slate-200">
-                        <nav className="flex gap-6" aria-label="Tabs">
-                            <Link
-                                href="/admin/pharmacies"
-                                className="border-b-2 border-transparent px-1 pb-4 text-sm font-medium text-slate-500 hover:border-slate-300 hover:text-slate-700"
-                            >
-                                All Pharmacies
-                            </Link>
-                            <div className="border-b-2 border-emerald-500 px-1 pb-4 text-sm font-semibold text-emerald-600">
-                                Pending Approval ({pharmacies.length})
-                            </div>
-                        </nav>
-                    </div>
+                    {loading ? (
+                        <div className="flex items-center justify-center gap-2 py-20 text-slate-400">
+                            <Loader2 className="h-5 w-5 animate-spin" />
+                            Loading pharmacy claims...
+                        </div>
+                    ) : claims.length === 0 ? (
+                        <div className="py-20 text-center">
+                            <CheckCircle className="mx-auto mb-3 h-12 w-12 text-green-400" />
 
-                    <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-                        <MetricCard
-                            label="Awaiting review"
-                            value={pharmacies.length}
-                            icon={Clock}
-                            color="text-amber-500"
-                            bg="bg-amber-50"
-                        />
-                        <MetricCard
-                            label="Districts"
-                            value={new Set(pharmacies.map((p) => p.district).filter(Boolean)).size}
-                            icon={MapPin}
-                            color="text-blue-500"
-                            bg="bg-blue-50"
-                        />
-                        <MetricCard
-                            label="Queue status"
-                            value={loading ? "..." : pharmacies.length === 0 ? "Clear" : "Open"}
-                            icon={Store}
-                            color="text-emerald-500"
-                            bg="bg-emerald-50"
-                        />
-                    </div>
+                            <h3 className="font-semibold text-slate-800">No pending claims</h3>
 
-                    {error && (
-                        <div className="rounded-xl border border-red-200 bg-red-50 px-5 py-4 text-sm text-red-600">
-                            <ShieldAlert className="mr-2 inline h-4 w-4" />
-                            {error}
+                            <p className="mt-1 text-sm text-slate-500">
+                                All pharmacy registration requests have been reviewed.
+                            </p>
+                        </div>
+                    ) : (
+                        <div className="divide-y divide-slate-100">
+                            {claims.map((claim) => (
+                                <div key={claim.id} className="p-6 transition hover:bg-slate-50/60">
+                                    <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
+                                        <div className="min-w-0 flex-1">
+                                            <div className="mb-3 flex items-center gap-3">
+                                                <Store className="h-5 w-5 text-blue-600" />
+
+                                                <h3 className="font-semibold text-slate-900">
+                                                    {claim.pharmacies?.name ?? "Unknown Pharmacy"}
+                                                </h3>
+
+                                                <span className="rounded-full bg-amber-50 px-2.5 py-1 text-xs font-semibold text-amber-600">
+                                                    PENDING
+                                                </span>
+                                            </div>
+
+                                            <div className="grid gap-3 text-sm text-slate-600 sm:grid-cols-2 lg:grid-cols-4">
+                                                <div>
+                                                    <p className="text-xs text-slate-400">Owner</p>
+
+                                                    <p className="mt-1 font-medium text-slate-800">
+                                                        {claim.owner_name}
+                                                    </p>
+                                                </div>
+
+                                                <div>
+                                                    <p className="text-xs text-slate-400">
+                                                        Drug License
+                                                    </p>
+
+                                                    <p className="mt-1 font-mono font-medium text-slate-800">
+                                                        {claim.drug_license_number}
+                                                    </p>
+                                                </div>
+
+                                                <div>
+                                                    <p className="text-xs text-slate-400">Phone</p>
+
+                                                    <p className="mt-1 font-medium text-slate-800">
+                                                        {claim.phone_number}
+                                                    </p>
+                                                </div>
+
+                                                <div>
+                                                    <p className="text-xs text-slate-400">
+                                                        Submitted
+                                                    </p>
+
+                                                    <p className="mt-1 font-medium text-slate-800">
+                                                        {new Date(
+                                                            claim.created_at
+                                                        ).toLocaleDateString()}
+                                                    </p>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <button
+                                            onClick={() => setSelectedClaim(claim)}
+                                            className="rounded-lg bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-blue-700"
+                                        >
+                                            Review Claim
+                                        </button>
+                                    </div>
+                                </div>
+                            ))}
                         </div>
                     )}
-
-                    <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
-                        <div className="flex items-center justify-between border-b border-slate-100 px-6 py-4">
-                            <h2 className="font-semibold text-slate-800">Registration queue</h2>
-                            <span className="text-xs text-slate-400">
-                                {pharmacies.length} pending
-                            </span>
-                        </div>
-
-                        {loading ? (
-                            <div className="flex items-center justify-center gap-2 py-16 text-slate-400">
-                                <Loader2 className="h-5 w-5 animate-spin" />
-                                Loading pharmacies...
-                            </div>
-                        ) : pharmacies.length === 0 ? (
-                            <div className="py-16 text-center text-slate-400">
-                                <CheckCircle className="mx-auto mb-2 h-10 w-10 text-emerald-400" />
-                                <p className="text-sm">No pending pharmacies</p>
-                            </div>
-                        ) : (
-                            <table className="w-full text-left">
-                                <thead>
-                                    <tr className="bg-slate-50 text-xs font-semibold tracking-wider text-slate-400 uppercase">
-                                        <th className="px-6 py-3">Pharmacy</th>
-                                        <th className="px-6 py-3">Location</th>
-                                        <th className="px-6 py-3">License</th>
-                                        <th className="px-6 py-3">Submitted</th>
-                                        <th className="px-6 py-3">Actions</th>
-                                    </tr>
-                                </thead>
-                                <tbody className="divide-y divide-slate-100">
-                                    {pharmacies.map((pharmacy) => (
-                                        <tr
-                                            key={pharmacy.id}
-                                            className="transition-colors hover:bg-slate-50/60"
-                                        >
-                                            <td className="px-6 py-4">
-                                                <p className="font-medium text-slate-800">
-                                                    {pharmacy.name}
-                                                </p>
-                                                <p className="mt-1 max-w-md text-sm text-slate-500">
-                                                    {pharmacy.address}
-                                                </p>
-                                                {pharmacy.phone_number && (
-                                                    <p className="mt-1 text-xs text-slate-400">
-                                                        {pharmacy.phone_number}
-                                                    </p>
-                                                )}
-                                            </td>
-                                            <td className="px-6 py-4 text-sm text-slate-600">
-                                                {pharmacy.district ?? "Unknown district"}
-                                                <span className="block text-xs text-slate-400">
-                                                    {pharmacy.state ?? "Unknown state"}
-                                                </span>
-                                            </td>
-                                            <td className="px-6 py-4">
-                                                <span className="rounded bg-slate-100 px-2 py-0.5 font-mono text-xs text-slate-600">
-                                                    {pharmacy.license_id ?? "N/A"}
-                                                </span>
-                                            </td>
-                                            <td className="px-6 py-4 text-sm text-slate-400">
-                                                {timeAgo(pharmacy.created_at)}
-                                            </td>
-                                            <td className="px-6 py-4">
-                                                <div className="flex gap-2">
-                                                    <ActionButton
-                                                        label="Approve"
-                                                        icon={CheckCircle}
-                                                        color="green"
-                                                        loading={
-                                                            updateStatusMutation.isPending &&
-                                                            updateStatusMutation.variables
-                                                                ?.pharmacyId === pharmacy.id &&
-                                                            updateStatusMutation.variables
-                                                                ?.status === "approved"
-                                                        }
-                                                        disabled={updateStatusMutation.isPending}
-                                                        onClick={() =>
-                                                            updateStatusMutation.mutate({
-                                                                pharmacyId: pharmacy.id,
-                                                                status: "approved",
-                                                            })
-                                                        }
-                                                    />
-                                                    <ActionButton
-                                                        label="Reject"
-                                                        icon={XCircle}
-                                                        color="red"
-                                                        loading={
-                                                            updateStatusMutation.isPending &&
-                                                            updateStatusMutation.variables
-                                                                ?.pharmacyId === pharmacy.id &&
-                                                            updateStatusMutation.variables
-                                                                ?.status === "rejected"
-                                                        }
-                                                        disabled={updateStatusMutation.isPending}
-                                                        onClick={() =>
-                                                            updateStatusMutation.mutate({
-                                                                pharmacyId: pharmacy.id,
-                                                                status: "rejected",
-                                                            })
-                                                        }
-                                                    />
-                                                </div>
-                                            </td>
-                                        </tr>
-                                    ))}
-                                </tbody>
-                            </table>
-                        )}
-                    </div>
                 </div>
             </main>
+
+            {/* Review Modal */}
+            {selectedClaim && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
+                    <div className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-2xl bg-white shadow-2xl">
+                        <div className="border-b border-slate-100 px-6 py-5">
+                            <div className="flex items-start justify-between gap-4">
+                                <div>
+                                    <h2 className="text-lg font-bold text-slate-900">
+                                        Review Pharmacy Claim
+                                    </h2>
+
+                                    <p className="mt-1 text-sm text-slate-500">
+                                        Verify the submitted pharmacy details.
+                                    </p>
+                                </div>
+
+                                <button
+                                    onClick={() => setSelectedClaim(null)}
+                                    className="rounded-lg p-2 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+                                >
+                                    <XCircle className="h-5 w-5" />
+                                </button>
+                            </div>
+                        </div>
+
+                        <div className="space-y-5 p-6">
+                            <DetailRow
+                                icon={Store}
+                                label="Pharmacy"
+                                value={selectedClaim.pharmacies?.name ?? "Unknown Pharmacy"}
+                            />
+
+                            <DetailRow
+                                icon={MapPin}
+                                label="Address"
+                                value={selectedClaim.pharmacies?.address ?? "Not available"}
+                            />
+
+                            <DetailRow icon={User} label="Owner" value={selectedClaim.owner_name} />
+
+                            <DetailRow
+                                icon={FileText}
+                                label="Drug License Number"
+                                value={selectedClaim.drug_license_number}
+                            />
+
+                            <DetailRow
+                                icon={Phone}
+                                label="Contact Number"
+                                value={selectedClaim.phone_number}
+                            />
+
+                            <div className="rounded-xl bg-amber-50 p-4 text-sm text-amber-800">
+                                <div className="flex gap-3">
+                                    <ShieldAlert className="h-5 w-5 shrink-0" />
+
+                                    <p>
+                                        Approving this claim will mark the pharmacy as verified and
+                                        enable its verified badge.
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="flex flex-col-reverse gap-3 border-t border-slate-100 bg-slate-50 px-6 py-5 sm:flex-row sm:justify-end">
+                            <button
+                                onClick={() => handleReject(selectedClaim.id)}
+                                disabled={!!acting}
+                                className="flex items-center justify-center gap-2 rounded-lg border border-red-200 bg-white px-5 py-2.5 text-sm font-semibold text-red-600 transition hover:bg-red-50 disabled:opacity-50"
+                            >
+                                {acting === selectedClaim.id ? (
+                                    <Loader2 className="h-4 w-4 animate-spin" />
+                                ) : (
+                                    <XCircle className="h-4 w-4" />
+                                )}
+                                Reject
+                            </button>
+
+                            <button
+                                onClick={() => handleApprove(selectedClaim.id)}
+                                disabled={!!acting}
+                                className="flex items-center justify-center gap-2 rounded-lg bg-green-600 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-green-700 disabled:opacity-50"
+                            >
+                                {acting === selectedClaim.id ? (
+                                    <Loader2 className="h-4 w-4 animate-spin" />
+                                ) : (
+                                    <CheckCircle className="h-4 w-4" />
+                                )}
+                                Approve & Verify
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }
 
-function MetricCard({
+function DetailRow({
+    icon: Icon,
     label,
     value,
-    icon: Icon,
-    color,
-    bg,
-}: Readonly<{
+}: {
+    icon: typeof Store;
     label: string;
-    value: number | string;
-    icon: React.ElementType;
-    color: string;
-    bg: string;
-}>) {
+    value: string;
+}) {
     return (
-        <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-            <div className={`mb-3 inline-flex rounded-xl p-2.5 ${bg} ${color}`}>
-                <Icon className="h-5 w-5" />
+        <div className="flex gap-4 rounded-xl border border-slate-100 bg-slate-50 p-4">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-white text-blue-600 shadow-sm">
+                <Icon className="h-4 w-4" />
             </div>
-            <p className="mb-1 text-xs text-slate-400">{label}</p>
-            <p className="text-2xl font-bold text-slate-900">{value}</p>
-        </div>
-    );
-}
 
-function ActionButton({
-    label,
-    icon: Icon,
-    color,
-    loading,
-    disabled,
-    onClick,
-}: Readonly<{
-    label: string;
-    icon: React.ElementType;
-    color: "green" | "red";
-    loading: boolean;
-    disabled: boolean;
-    onClick: () => void;
-}>) {
-    return (
-        <button
-            onClick={onClick}
-            disabled={disabled}
-            className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-40 ${
-                color === "green"
-                    ? "bg-green-50 text-green-600 hover:bg-green-100"
-                    : "bg-red-50 text-red-600 hover:bg-red-100"
-            }`}
-        >
-            {loading ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-                <Icon className="h-3.5 w-3.5" />
-            )}
-            {label}
-        </button>
+            <div className="min-w-0">
+                <p className="text-xs text-slate-400">{label}</p>
+                <p className="mt-1 font-medium break-words text-slate-800">{value}</p>
+            </div>
+        </div>
     );
 }
