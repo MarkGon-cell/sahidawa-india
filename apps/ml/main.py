@@ -117,6 +117,13 @@ extract_loaded = include_router_if_available(
 if not extract_loaded:
     logger.warning("Medicine-extraction routes are disabled in this runtime.")
 
+include_router_if_available(
+    app,
+    "routers.pill_identifier",
+    required=True,
+    dependencies=auth,
+)
+
 @app.get("/")
 @app.head("/")
 def read_root():

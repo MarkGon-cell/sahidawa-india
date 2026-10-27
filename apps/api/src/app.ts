@@ -16,6 +16,7 @@ import { limiter, healthLimiter } from "./middleware/rateLimit";
 
 import abhaRoutes from "./routes/abha";
 import trackingRouter from "./routes/tracking";
+import pillIdentifierRouter from "./routes/pillIdentifier";
 // ── Environment Configuration ──────────────────────────────────────────────
 const rootEnvPath = path.resolve(__dirname, "../../../.env");
 // dotenv.config() now runs in index.ts, before this file is imported —
@@ -397,7 +398,7 @@ app.use("/api/keys", apiKeysRouter);
 app.use("/api/medicine/safety", safetyRouter);
 app.use("/api/compare", compareRouter);
 app.use("/api/partner", partnerRouter);
-
+app.use("/api/v1/ai/pill-identifier", pillIdentifierRouter);
 // ── Swagger UI Documentation (/api/docs) ──────────────────────────────────
 app.use(
     "/api/docs",
