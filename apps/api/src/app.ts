@@ -85,6 +85,7 @@ import { requestTimeout } from "./middleware/requestTimeout";
 import { aggregateRateLimit } from "./middleware/aggregateRateLimit";
 import { botDetection } from "./middleware/botDetection";
 import { queryMetricsMiddleware } from "./middleware/queryMetrics";
+import labAnalyzerRouter from "./routes/labAnalyzer";
 // ── Application Initialization ─────────────────────────────────────────────
 const app: Express = express();
 app.set("trust proxy", 1); // Trust first proxy (Nginx) — fixes req.ip for rate limiters
@@ -397,6 +398,7 @@ app.use("/api/keys", apiKeysRouter);
 app.use("/api/medicine/safety", safetyRouter);
 app.use("/api/compare", compareRouter);
 app.use("/api/partner", partnerRouter);
+app.use("/api/v1/ai/lab-analyzer", labAnalyzerRouter);
 
 // ── Swagger UI Documentation (/api/docs) ──────────────────────────────────
 app.use(

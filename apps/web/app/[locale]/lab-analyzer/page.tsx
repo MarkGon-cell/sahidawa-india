@@ -14,6 +14,8 @@ import {
     ArrowUpCircle,
 } from "lucide-react";
 import { Link } from "@/i18n/routing";
+import { useSession } from "@/src/components/AuthProvider";
+import { analyzeLabReport } from "@/lib/api/labAnalyzer";
 
 interface LabTest {
     testName: string;
@@ -32,6 +34,7 @@ const ACCEPTED = "image/jpeg, image/png, image/webp, application/pdf";
 
 export default function LabAnalyzerPage() {
     const t = useTranslations("LabAnalyzer");
+    const { token } = useSession();
     const [file, setFile] = useState<File | null>(null);
     const [preview, setPreview] = useState<string | null>(null);
     const [result, setResult] = useState<LabResult | null>(null);
@@ -67,34 +70,29 @@ export default function LabAnalyzerPage() {
             setError(t("errors.emptyUpload"));
             return;
         }
+        if (!token) {
+            setError(t("errors.network"));
+            return;
+        }
+
         setIsAnalyzing(true);
         setError(null);
+
         try {
-            const formData = new FormData();
-            formData.append("file", file);
-
-            const res = await fetch("/api/v1/ai/lab-analyzer", {
-                method: "POST",
-                body: formData,
-            });
-            const data = await res.json();
-
-            if (!res.ok) {
-                const errorKeys = [
-                    "emptyUpload",
-                    "unsupportedFile",
-                    "fileTooLarge",
-                    "apiFailure",
-                    "unreadable",
-                    "network",
-                ];
-                const errorKey = errorKeys.includes(data.error) ? data.error : "network";
-                throw new Error(errorKey);
-            }
-            setResult(data as LabResult);
+            const data = await analyzeLabReport(file, token);
+            setResult(data);
         } catch (err) {
             const message = err instanceof Error ? err.message : "network";
-            setError(t(`errors.${message}` as never));
+            const errorKeys = [
+                "emptyUpload",
+                "unsupportedFile",
+                "fileTooLarge",
+                "apiFailure",
+                "unreadable",
+                "network",
+            ];
+            const errorKey = errorKeys.includes(message) ? message : "network";
+            setError(t(`errors.${errorKey}` as never));
         } finally {
             setIsAnalyzing(false);
         }
